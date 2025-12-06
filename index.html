@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="stylesheet" href="style.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tictactoe</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Realtime Multiplayer</p>
+          <h1>Tic Tac Toe</h1>
+        </div>
+        <div class="turn-chip">
+          <p class="label">Current turn</p>
+          <p id="whosTurn">X's Turn</p>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="status-stack">
+          <article class="info-card status-card">
+            <h2>Players</h2>
+            <div class="player-row">
+              <p id="userCont">You <br><span id="user"></span></p>
+              <br>
+              <p id="oppNameCont">Opponent <br><span id="oppName"></span></p>
+            </div>
+          </article>
+
+          <article class="info-card status-card">
+            <h2>Assigned Mark</h2>
+            <p id="valueCont">You are playing as<br><span id="value"></span></p>
+          </article>
+
+          <article class="info-card name-card">
+            <h2>Find Opponent</h2>
+            <label id="enterName" for="name">Enter your Name :</label>
+            <input type="text" placeholder="Name" id="name" autocomplete="off" />
+            <div class="name-actions">
+              <button id="find">Search for a player</button>
+              <div class="loading-wrap">
+                <img src="loading.gif" alt="loading" id="loading" />
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="board-panel">
+          <div id="bigCont">
+            <div id="cont">
+              <button id="btn1" class="btn"></button>
+              <button id="btn2" class="btn"></button>
+              <button id="btn3" class="btn"></button>
+              <button id="btn4" class="btn"></button>
+              <button id="btn5" class="btn"></button>
+              <button id="btn6" class="btn"></button>
+              <button id="btn7" class="btn"></button>
+              <button id="btn8" class="btn"></button>
+              <button id="btn9" class="btn"></button>
+            </div>
+          </div>
+        </section>
+        <div class="rio-footer">© Rio</div>
+      </main>
+    </div>
+    
+    <div id="gameModal" class="modal hidden">
+      <div class="modal-panel">
+        <p id="modalMessage"></p>
+        <button id="modalAction">Okay</button>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script>
+  </body>
+</html>
