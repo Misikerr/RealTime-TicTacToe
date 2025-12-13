@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <!-- <link rel="icon" type="image/svg+xml" href="/vite.svg" /> -->
     <link rel="stylesheet" href="style.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>tictactoe</title>
@@ -37,15 +37,55 @@
           </article>
 
           <article class="info-card name-card">
-            <h2>Find Opponent</h2>
-            <label id="enterName" for="name">Enter your Name :</label>
-            <input type="text" placeholder="Name" id="name" autocomplete="off" />
+            <h2>Login &amp; Match</h2>
+            <p id="authStatus">Login with Telegram to start playing.</p>
+            <div id="telegramLogin" data-inline-widget="true"></div>
+            <script>
+              // Capture Telegram auth early; queue until main script attaches handler
+              window.__pendingTelegramAuth = window.__pendingTelegramAuth || [];
+              window.__receiveTelegramAuth = function(user){
+                if(!user){
+                  return;
+                }
+                window.__pendingTelegramAuth.push(user);
+                if(typeof window.enqueueTelegramAuth === 'function'){
+                  window.enqueueTelegramAuth(user);
+                } else if(typeof window.onTelegramAuth === 'function'){
+                  window.onTelegramAuth(user);
+                }
+              };
+            </script>
+            <script
+              async
+              src="https://telegram.org/js/telegram-widget.js?22"
+              data-telegram-login="tictactoe_auth_bot"
+              data-size="large"
+              data-onauth="__receiveTelegramAuth"
+              data-request-access="write">
+            </script>
+
             <div class="name-actions">
-              <button id="find">Search for a player</button>
+              <button id="quickPlay">Quick Play</button>
               <div class="loading-wrap">
                 <img src="loading.gif" alt="loading" id="loading" />
               </div>
             </div>
+
+            <div class="name-actions">
+              <button id="createInvite">Create invite link</button>
+              <input type="text" id="inviteLink" placeholder="Invite link" readonly />
+            </div>
+
+            <div class="name-actions">
+              <input type="text" id="joinCode" placeholder="Paste invite code" />
+              <button id="joinInvite">Join via invite</button>
+            </div>
+          </article>
+
+          <article class="info-card leaderboard-card">
+            <h2>Leaderboard</h2>
+            <ul id="leaderboardList"></ul>
+            <button id="refreshLeaderboard">Refresh leaderboard</button>
           </article>
         </section>
 
@@ -74,8 +114,7 @@
         <button id="modalAction">Okay</button>
       </div>
     </div>
-    <script type="module" src="/src/main.js"></script>
     <script src="/socket.io/socket.io.js"></script>
-    <script src="script.js"></script>
+    <script type="module" src="/script.js"></script>
   </body>
 </html>

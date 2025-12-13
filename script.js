@@ -5,6 +5,23 @@ document.getElementById("oppNameCont").style.display = "none";
 document.getElementById("valueCont").style.display = "none";
 document.getElementById("whosTurn").style.display = "none";
 
+// Queue to capture Telegram auth callbacks that may fire before this module loads
+window.__pendingTelegramAuth = window.__pendingTelegramAuth || [];
+const enqueueTelegramAuth = (user) => {
+    if(!user){
+        return;
+    }
+    window.__pendingTelegramAuth.push(user);
+    if(typeof window.onTelegramAuth === 'function'){
+        try {
+            window.onTelegramAuth(user);
+        } catch (err){
+            console.error('Deferred auth handler failed', err);
+        }
+    }
+};
+window.enqueueTelegramAuth = enqueueTelegramAuth;
+
 const statusCards = document.querySelectorAll(".status-card");
 const nameCard = document.querySelector(".name-card");
 const turnDisplay = document.getElementById("whosTurn");
@@ -12,6 +29,14 @@ const defaultTurnColor = turnDisplay ? getComputedStyle(turnDisplay).color : '';
 const modal = document.getElementById("gameModal");
 const modalMessage = document.getElementById("modalMessage");
 const modalAction = document.getElementById("modalAction");
+const authStatus = document.getElementById("authStatus");
+const leaderboardList = document.getElementById("leaderboardList");
+const refreshLeaderboardBtn = document.getElementById("refreshLeaderboard");
+const quickPlayBtn = document.getElementById("quickPlay");
+const createInviteBtn = document.getElementById("createInvite");
+const joinInviteBtn = document.getElementById("joinInvite");
+const inviteLinkInput = document.getElementById("inviteLink");
+const joinCodeInput = document.getElementById("joinCode");
 let modalCallback = null;
 
 statusCards.forEach(card => {
@@ -25,6 +50,13 @@ let myMark = '';
 let currentTurn = 'X';
 let matchFinished = false;
 let countdownInterval = null;
+let authToken = null;
+let currentUser = null;
+
+if(quickPlayBtn){
+    quickPlayBtn.disabled = true;
+}
+
 if(modalAction){
     modalAction.addEventListener("click", () => {
         hideModal();
@@ -76,21 +108,175 @@ const disableBoard = () => {
     });
 };
 
-document.getElementById("find").addEventListener("click", function(){
-    const enteredName = document.getElementById("name").value.trim();
+const safeDisplayName = (user) => {
+    if(!user){
+        return '';
+    }
+    return user.username || user.first_name || `tg-${user.id || 'user'}`;
+};
 
-    if(!enteredName){
-        showModal("Please enter a valid name.", "Try again");
+const renderLeaderboard = (items = []) => {
+    if(!leaderboardList){
         return;
     }
+    leaderboardList.innerHTML = '';
+    if(items.length === 0){
+        const li = document.createElement('li');
+        li.textContent = 'No games played yet.';
+        leaderboardList.appendChild(li);
+        return;
+    }
+    items.slice(0, 10).forEach((entry, idx) => {
+        const li = document.createElement('li');
+        li.textContent = `${idx + 1}. ${entry.name} — W:${entry.wins} D:${entry.draws} L:${entry.losses}`;
+        leaderboardList.appendChild(li);
+    });
+};
 
-    name = enteredName;
-    document.getElementById("user").innerText = name;
+async function fetchLeaderboard(){
+    try {
+        const res = await fetch('/api/leaderboard');
+        const data = await res.json();
+        if(data?.leaderboard){
+            renderLeaderboard(data.leaderboard);
+        }
+    } catch (err){
+        console.error('Failed to fetch leaderboard', err);
+    }
+}
 
-    socket.emit("find", {name: name});
-    document.getElementById("loading").style.display = "block";
-    document.getElementById("find").disabled=true;
-})
+async function authenticateWithServer(user){
+    console.info('[auth] received payload from widget', user);
+    try {
+        const res = await fetch('/api/auth/telegram', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(user)
+        });
+        const data = await res.json();
+        console.info('[auth] server response', { status: res.status, data });
+        if(!res.ok || !data?.ok){
+            console.error('Telegram auth failed', data);
+            showModal(data?.error || 'Telegram auth failed.');
+            return;
+        }
+        authToken = data.token;
+        currentUser = data.user;
+        name = safeDisplayName(currentUser);
+        document.getElementById("user").innerText = name;
+        if(authStatus){
+            authStatus.textContent = `Logged in as ${currentUser.username ? '@' + currentUser.username : name}`;
+        }
+        if(quickPlayBtn){
+            quickPlayBtn.disabled = false;
+        }
+        statusCards.forEach(card => card.style.display = "block");
+        if(nameCard){
+            nameCard.style.display = "block";
+        }
+        await fetchLeaderboard();
+    } catch (err){
+        console.error('Auth error', err);
+        showModal('Could not complete Telegram login.');
+    }
+}
+
+async function loadTelegramWidget(){
+    try {
+        const container = document.getElementById('telegramLogin');
+        const inlinePresent = container && (container.dataset.inlineWidget === 'true');
+        const scriptAlreadyOnPage = document.querySelector('script[data-telegram-login]');
+        if(inlinePresent || scriptAlreadyOnPage){
+            // Widget already inlined; do not overwrite
+            return;
+        }
+
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        const botUser = data?.telegramBotUsername;
+        if(!botUser){
+            if(authStatus){
+                authStatus.textContent = 'Set TELEGRAM_BOT_USERNAME on the server to enable login.';
+            }
+            return;
+        }
+        if(!container){
+            return;
+        }
+        container.innerHTML = '';
+        const script = document.createElement('script');
+        script.src = 'https://telegram.org/js/telegram-widget.js?22';
+        script.async = true;
+        script.setAttribute('data-telegram-login', botUser);
+        script.setAttribute('data-size', 'large');
+        script.setAttribute('data-onauth', 'onTelegramAuth');
+        script.setAttribute('data-request-access', 'write');
+        container.appendChild(script);
+    } catch (err){
+        console.error('Failed to load Telegram widget', err);
+    }
+}
+
+// Make auth callback available under multiple global names for the widget
+window.onTelegramAuth = async function(user){
+    console.log('Telegram auth payload', user);
+    await authenticateWithServer(user);
+};
+window.TelegramAuth = window.onTelegramAuth;
+window.TelegramLoginWidgetCallback = window.onTelegramAuth;
+
+// Flush any auth payloads that arrived before this handler existed
+if(Array.isArray(window.__pendingTelegramAuth) && window.__pendingTelegramAuth.length){
+    const queued = window.__pendingTelegramAuth.splice(0);
+    queued.forEach((u) => {
+        try {
+            window.onTelegramAuth(u);
+        } catch (err){
+            console.error('Queued auth dispatch failed', err);
+        }
+    });
+}
+
+if(quickPlayBtn){
+    quickPlayBtn.addEventListener("click", function(){
+        if(!authToken){
+            showModal("Login with Telegram first.");
+            return;
+        }
+
+        name = safeDisplayName(currentUser);
+        document.getElementById("user").innerText = name;
+
+        socket.emit("quickFind", { token: authToken });
+        document.getElementById("loading").style.display = "block";
+        quickPlayBtn.disabled=true;
+    });
+}
+
+if(createInviteBtn){
+    createInviteBtn.addEventListener('click', () => {
+        if(!authToken){
+            showModal("Login with Telegram first.");
+            return;
+        }
+        socket.emit('createInvite', { token: authToken });
+    });
+}
+
+if(joinInviteBtn){
+    joinInviteBtn.addEventListener('click', () => {
+        if(!authToken){
+            showModal("Login with Telegram first.");
+            return;
+        }
+        const code = joinCodeInput?.value.trim();
+        if(!code){
+            showModal("Enter an invite code.");
+            return;
+        }
+        socket.emit('joinInvite', { token: authToken, code });
+    });
+}
 
 socket.on("find", (e)=>{
     const allPlayers = e.allPlayers || []; 
@@ -99,9 +285,9 @@ socket.on("find", (e)=>{
     document.getElementById("oppNameCont").style.display = "block";
     document.getElementById("valueCont").style.display = "block";
     document.getElementById("loading").style.display = "none";
-    document.getElementById("name").style.display = "none";
-    document.getElementById("find").style.display = "none";
-    document.getElementById("enterName").style.display = "none";
+    if(quickPlayBtn){
+        quickPlayBtn.style.display = "none";
+    }
     document.getElementById("bigCont").style.display = "block";
     document.getElementById("whosTurn").style.display = "block";
     document.getElementById("whosTurn").innerText = "X's Turn";
@@ -109,22 +295,22 @@ socket.on("find", (e)=>{
         card.style.display = "block";
     });
     if(nameCard){
-        nameCard.style.display = "none";
+        nameCard.style.display = "block";
     }
 
     let oppName = "";
     let value = "";
 
-    const foundObj = allPlayers.find(obj => obj.p1?.p1name === name || obj.p2?.p2name === name);
+    const foundObj = allPlayers.find(obj => obj.p1?.name === name || obj.p2?.name === name);
 
     if(!foundObj){
         console.warn("Player not found in match list yet", { name, allPlayers });
         return;
     }
 
-    const isPlayerOne = foundObj.p1?.p1name === name;
-    oppName = isPlayerOne ? foundObj.p2?.p2name : foundObj.p1?.p1name;
-    value = isPlayerOne ? foundObj.p1?.p1value : foundObj.p2?.p2value;
+    const isPlayerOne = foundObj.p1?.name === name;
+    oppName = isPlayerOne ? foundObj.p2?.name : foundObj.p1?.name;
+    value = isPlayerOne ? 'X' : 'O';
 
     if(!oppName || !value){
         console.warn("Opponent or value missing in match data", { foundObj });
@@ -136,24 +322,20 @@ socket.on("find", (e)=>{
     myMark = value;
     currentTurn = 'X';
     startTurnTimer();
-})
+});
 
 document.querySelectorAll(".btn").forEach(btn => {
     btn.addEventListener("click", () => {
-        const value = document.getElementById("value").innerText.trim();
-        if(!value || btn.disabled || matchFinished){
+        if(btn.disabled || matchFinished){
             return;
         }
-        if(value !== myMark){
-            return;
-        }
-        if(myMark !== currentTurn){
+        if(!authToken || !myMark || myMark !== currentTurn){
             return;
         }
 
-        socket.emit("playing", { value, id: btn.id, name });
+        socket.emit("playing", { id: btn.id, token: authToken });
     });
-})
+});
 
 socket.on("playing", (payload)=>{
     const allPlayers = payload?.allPlayers;
@@ -161,14 +343,14 @@ socket.on("playing", (payload)=>{
         return;
     }
 
-    const foundObj = allPlayers.find(obj => obj.p1?.p1name === name || obj.p2?.p2name === name);
+    const foundObj = allPlayers.find(obj => obj.p1?.name === name || obj.p2?.name === name);
     if(!foundObj){
         console.warn("Match not found in update", { name, allPlayers });
         return;
     }
     
-    const p1id = foundObj.p1?.p1move;
-    const p2id = foundObj.p2?.p2move;
+    const p1id = foundObj.p1?.move;
+    const p2id = foundObj.p2?.move;
 
     if(document.getElementById("whosTurn")){
         const nextTurn = foundObj.currentTurn || ((foundObj.sum % 2 === 0) ? "O" : "X");
@@ -219,8 +401,8 @@ function check(name){
         matchFinished = true;
         disableBoard();
         stopTurnTimer();
-        const winner = currentTurn === "X" ? "O" : "X";
-        socket.emit("gameOver", { name, result: "win", winner });
+        const winnerMark = currentTurn === "X" ? "O" : "X";
+        socket.emit("gameOver", { token: authToken, result: "win", winnerMark });
         return;
     }
 
@@ -229,7 +411,7 @@ function check(name){
         matchFinished = true;
         disableBoard();
         stopTurnTimer();
-        socket.emit("gameOver", { name, result: "draw" });
+        socket.emit("gameOver", { token: authToken, result: "draw" });
     }
 }
 
@@ -255,6 +437,29 @@ socket.on("matchEnded", ({ players, result, winner }) => {
 
 socket.on("invalidMove", ({ reason }) => {
     console.warn("Invalid move rejected by server", reason);
+});
+
+socket.on("leaderboardUpdated", ({ leaderboard }) => {
+    renderLeaderboard(leaderboard || []);
+});
+
+socket.on("authError", ({ message }) => {
+    showModal(message || 'Authentication required.');
+});
+
+socket.on('inviteCreated', ({ code }) => {
+    if(!code){
+        return;
+    }
+    const url = `${window.location.origin}?invite=${code}`;
+    if(inviteLinkInput){
+        inviteLinkInput.value = url;
+    }
+    showModal('Invite link created. Share it with your friend.', 'Done');
+});
+
+socket.on('inviteError', ({ message }) => {
+    showModal(message || 'Invite error.');
 });
 
 function startTurnTimer(){
@@ -298,3 +503,33 @@ function stopTurnTimer(){
         turnDisplay.style.color = defaultTurnColor;
     }
 }
+
+if(refreshLeaderboardBtn){
+    refreshLeaderboardBtn.addEventListener('click', fetchLeaderboard);
+}
+
+// Kick off auth widget and initial leaderboard
+loadTelegramWidget();
+fetchLeaderboard();
+
+// Auto-join invite if present in URL
+const urlParams = new URLSearchParams(window.location.search);
+const inviteParam = urlParams.get('invite');
+if(inviteParam){
+    if(joinCodeInput){
+        joinCodeInput.value = inviteParam;
+    }
+    // Wait for auth; user must click Join after login
+}
+
+// Fallback listener: capture Telegram widget postMessage if onAuth is not firing
+window.addEventListener('message', (event) => {
+    if(typeof event?.data !== 'object'){
+        return;
+    }
+    const fromTelegram = typeof event.origin === 'string' && event.origin.includes('telegram.org');
+    if(fromTelegram && event.data.event === 'auth_user' && event.data.user){
+        console.log('Telegram postMessage auth', event.data.user);
+        window.onTelegramAuth(event.data.user);
+    }
+});

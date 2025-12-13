@@ -181,12 +181,42 @@ p {
   flex-wrap: wrap;
 }
 
+#inviteLink,
+#joinCode {
+  flex: 1;
+  min-width: 180px;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--text-strong);
+}
+
 .loading-wrap {
   width: 48px;
   height: 48px;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.leaderboard-card ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  color: var(--text-strong);
+}
+
+.leaderboard-card li {
+  padding: 0.35rem 0.5rem;
+  border-radius: 10px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  font-family: 'Share Tech Mono', 'Space Grotesk', sans-serif;
+  letter-spacing: 0.04rem;
 }
 
 #loading {

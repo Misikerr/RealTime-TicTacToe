@@ -4,66 +4,213 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
+import crypto from 'node:crypto';
 
 dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
+app.set('etag', false);
 
-let arr = [];
-let playingArray = [];
+app.use(express.json());
+const noStore = (_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    res.set('Pragma', 'no-cache');
+    next();
+};
+app.use('/api', noStore);
+
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
+const ALLOW_GUESTS = String(process.env.ALLOW_GUESTS || '').toLowerCase() === 'true';
+
+const waitingQueue = [];
+const pendingInvites = new Map(); // code -> {user}
+const playingArray = [];
+const authTokens = new Map(); // token -> user payload
+const leaderboard = new Map(); // userId -> stats
+
+const hashSecret = TELEGRAM_BOT_TOKEN
+  ? crypto.createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest()
+  : null;
+
+const safeDisplayName = (user) => {
+    if(!user){
+        return 'unknown';
+    }
+    return user.username || user.first_name || `tg-${user.id}`;
+};
+
+const verifyTelegramAuth = (payload = {}) => {
+    if(!hashSecret){
+        return { valid: false, reason: 'missingSecret' };
+    }
+    const { hash, ...rest } = payload;
+    const checkString = Object.keys(rest)
+        .sort()
+        .map((key) => `${key}=${rest[key]}`)
+        .join('\n');
+
+    const hmac = crypto
+        .createHmac('sha256', hashSecret)
+        .update(checkString)
+        .digest('hex');
+
+    return { valid: hmac === hash, reason: hmac === hash ? null : 'badSignature', computed: hmac, provided: hash };
+};
+
+const mintAuthToken = (user) => {
+    const token = crypto.randomBytes(24).toString('hex');
+    authTokens.set(token, user);
+    return token;
+};
+
+const requireUserFromToken = (token) => {
+    if(!token){
+        return null;
+    }
+    return authTokens.get(token) || null;
+};
+
+const updateLeaderboard = (match, result, winnerMark) => {
+    if(!match){
+        return;
+    }
+    const ensureEntry = (player, isWinner, isDraw) => {
+        if(!player){
+            return;
+        }
+        const key = String(player.id);
+        const existing = leaderboard.get(key) || { id: player.id, name: player.name, wins: 0, losses: 0, draws: 0 };
+        if(isDraw){
+            existing.draws += 1;
+        } else if(isWinner){
+            existing.wins += 1;
+        } else {
+            existing.losses += 1;
+        }
+        existing.name = player.name;
+        leaderboard.set(key, existing);
+    };
+
+    if(result === 'draw'){
+        ensureEntry(match.p1, false, true);
+        ensureEntry(match.p2, false, true);
+    } else if(result === 'win'){
+        const winner = winnerMark === 'X' ? match.p1 : match.p2;
+        const loser = winnerMark === 'X' ? match.p2 : match.p1;
+        ensureEntry(winner, true, false);
+        ensureEntry(loser, false, false);
+    }
+};
 
 io.on('connection', (socket) => {
-    socket.on('find', (e) => {
-        
-        if(e.name!== null){
-            arr.push(e.name);
-
-            if(arr.length >= 2){
-                let p1obj = {
-                    p1name: arr[0],
-                    p1value: 'X',
-                    p1move: ""
-                }
-                let p2obj = {
-                    p2name: arr[1],
-                    p2value: 'O',
-                    p2move: ""
-                }
-
-                let obj = {
-                    p1: p1obj,
-                    p2: p2obj,
-                    sum: 1,
-                    board: {},
-                    turnDeadline: Date.now() + 30000,
-                    matchFinished: false,
-                    timedOutPlayer: null,
-                    timedOutMark: null,
-                    currentTurn: 'X'
-                }
-                playingArray.push(obj);
-
-                arr.splice(0,2);
-
-                io.emit("find",{allPlayers: playingArray})
-            }
-        }
-    });
-
-    socket.on('playing', ({ value, id, name }) => {
-        if(!value || !id || !name){
+    socket.on('quickFind', ({ token }) => {
+        const user = requireUserFromToken(token);
+        if(!user){
+            socket.emit('authError', { message: 'Unauthorized' });
             return;
         }
 
-        const match = playingArray.find(obj => obj.p1?.p1name === name || obj.p2?.p2name === name);
+        // Prevent duplicate queue entries for the same user
+        const alreadyQueued = waitingQueue.some(p => p.id === user.id);
+        if(!alreadyQueued){
+            waitingQueue.push({ id: user.id, name: safeDisplayName(user), token });
+        }
+
+        if(waitingQueue.length >= 2){
+            const p1 = waitingQueue.shift();
+            const p2 = waitingQueue.shift();
+
+            const match = {
+                p1: { id: p1.id, name: p1.name, value: 'X', move: '' },
+                p2: { id: p2.id, name: p2.name, value: 'O', move: '' },
+                sum: 1,
+                board: {},
+                turnDeadline: Date.now() + 30000,
+                matchFinished: false,
+                timedOutPlayer: null,
+                timedOutMark: null,
+                currentTurn: 'X'
+            };
+
+            playingArray.push(match);
+            io.emit('find', { allPlayers: playingArray });
+        }
+    });
+
+    socket.on('createInvite', ({ token }) => {
+        const user = requireUserFromToken(token);
+        if(!user){
+            socket.emit('authError', { message: 'Unauthorized' });
+            return;
+        }
+        // One invite per user; replace existing
+        for (const [code, entry] of pendingInvites.entries()){
+            if(entry.user.id === user.id){
+                pendingInvites.delete(code);
+                break;
+            }
+        }
+        const code = crypto.randomBytes(6).toString('hex');
+        pendingInvites.set(code, { user });
+        socket.emit('inviteCreated', { code });
+    });
+
+    socket.on('joinInvite', ({ token, code }) => {
+        const user = requireUserFromToken(token);
+        if(!user || !code){
+            socket.emit('authError', { message: 'Unauthorized' });
+            return;
+        }
+        const host = pendingInvites.get(code);
+        if(!host){
+            socket.emit('inviteError', { message: 'Invite not found or already used.' });
+            return;
+        }
+        if(host.user.id === user.id){
+            socket.emit('inviteError', { message: 'Cannot join your own invite.' });
+            return;
+        }
+
+        pendingInvites.delete(code);
+
+        const match = {
+            p1: { id: host.user.id, name: safeDisplayName(host.user), value: 'X', move: '' },
+            p2: { id: user.id, name: safeDisplayName(user), value: 'O', move: '' },
+            sum: 1,
+            board: {},
+            turnDeadline: Date.now() + 30000,
+            matchFinished: false,
+            timedOutPlayer: null,
+            timedOutMark: null,
+            currentTurn: 'X'
+        };
+
+        playingArray.push(match);
+        io.emit('find', { allPlayers: playingArray });
+    });
+
+    socket.on('playing', ({ id, token }) => {
+        if(!id || !token){
+            return;
+        }
+
+        const user = requireUserFromToken(token);
+        if(!user){
+            socket.emit('authError', { message: 'Unauthorized' });
+            return;
+        }
+
+        const match = playingArray.find(obj => obj.p1?.id === user.id || obj.p2?.id === user.id);
         if(!match || match.matchFinished){
             return;
         }
 
+        const playerMark = match.p1?.id === user.id ? 'X' : 'O';
         const expectedTurn = (match.sum % 2 !== 0) ? 'X' : 'O';
-        if(value !== expectedTurn){
+        if(playerMark !== expectedTurn){
             socket.emit('invalidMove', { reason: 'notYourTurn' });
             return;
         }
@@ -74,31 +221,31 @@ io.on('connection', (socket) => {
             return;
         }
 
-        match.board[id] = value;
+        match.board[id] = playerMark;
 
-        if(match.p1?.p1name === name){
-            match.p1.p1move = id;
-        } else if(match.p2?.p2name === name){
-            match.p2.p2move = id;
+        if(playerMark === 'X'){
+            match.p1.move = id;
         } else {
-            return;
+            match.p2.move = id;
         }
 
         match.sum = typeof match.sum === 'number' ? match.sum + 1 : 2;
         match.turnDeadline = Date.now() + 30000;
         match.timedOutPlayer = null;
         match.timedOutMark = null;
-        match.currentTurn = value === 'X' ? 'O' : 'X';
+        match.currentTurn = playerMark === 'X' ? 'O' : 'X';
 
         io.emit('playing', { allPlayers: playingArray });
     });
 
-    socket.on('gameOver', ({ name, result, winner }) => {
-        if(!name){
+    socket.on('gameOver', ({ token, result, winnerMark }) => {
+        const user = requireUserFromToken(token);
+        if(!user){
+            socket.emit('authError', { message: 'Unauthorized' });
             return;
         }
 
-        const matchIndex = playingArray.findIndex(obj => obj.p1?.p1name === name || obj.p2?.p2name === name);
+        const matchIndex = playingArray.findIndex(obj => obj.p1?.id === user.id || obj.p2?.id === user.id);
         if(matchIndex === -1){
             return;
         }
@@ -111,12 +258,16 @@ io.on('connection', (socket) => {
         match.currentTurn = null;
 
         const [finishedMatch] = playingArray.splice(matchIndex, 1);
-        const players = [finishedMatch?.p1?.p1name, finishedMatch?.p2?.p2name].filter(Boolean);
+        const players = [finishedMatch?.p1?.name, finishedMatch?.p2?.name].filter(Boolean);
 
+        updateLeaderboard(finishedMatch, result || 'win', winnerMark);
+        io.emit('leaderboardUpdated', { leaderboard: Array.from(leaderboard.values()) });
+
+        const winnerName = winnerMark === 'X' ? finishedMatch?.p1?.name : finishedMatch?.p2?.name;
         io.emit('matchEnded', {
             players,
             result: result || 'win',
-            winner: winner || null
+            winner: winnerName || winnerMark || null
         });
     });
 });
@@ -131,7 +282,7 @@ setInterval(() => {
         }
         if(match.turnDeadline && match.turnDeadline < now){
             const timedOutMark = (match.sum % 2 !== 0) ? 'X' : 'O';
-            const timedOutPlayer = timedOutMark === 'X' ? match.p1?.p1name : match.p2?.p2name;
+            const timedOutPlayer = timedOutMark === 'X' ? match.p1?.name : match.p2?.name;
 
             match.sum = typeof match.sum === 'number' ? match.sum + 1 : 2;
             match.turnDeadline = Date.now() + 30000;
@@ -152,6 +303,52 @@ const __dirname = path.dirname(__filename);
 
 // Serve the built frontend (or static assets) from the project root
 app.use(express.static(__dirname));
+
+app.get('/api/config', (_req, res) => {
+    res.json({ telegramBotUsername: TELEGRAM_BOT_USERNAME || null });
+});
+
+app.post('/api/auth/telegram', (req, res) => {
+    const payload = req.body || {};
+    const validation = hashSecret ? verifyTelegramAuth(payload) : { valid: false, reason: 'missingSecret' };
+
+    if(!validation.valid){
+        const guestId = `guest-${crypto.randomBytes(8).toString('hex')}`;
+        const guestName = payload.username || payload.first_name || `guest-${guestId.slice(6, 12)}`;
+        const guestUser = {
+            id: guestId,
+            username: guestName,
+            first_name: guestName,
+            last_name: null,
+            photo_url: null,
+            auth_date: Date.now()
+        };
+        const token = mintAuthToken(guestUser);
+        console.warn('Telegram auth invalid; issuing guest session', { validation, payloadPreview: { id: payload.id, username: payload.username, first_name: payload.first_name, last_name: payload.last_name } });
+        return res.json({ ok: true, guest: true, token, user: { id: guestUser.id, username: guestUser.username, first_name: guestUser.first_name, photo_url: guestUser.photo_url } });
+    }
+
+    const user = {
+        id: payload.id,
+        username: payload.username,
+        first_name: payload.first_name,
+        last_name: payload.last_name,
+        photo_url: payload.photo_url,
+        auth_date: payload.auth_date
+    };
+
+    const token = mintAuthToken(user);
+    res.json({ ok: true, token, user: { id: user.id, username: user.username, first_name: user.first_name, photo_url: user.photo_url } });
+});
+
+app.get('/api/leaderboard', (_req, res) => {
+    const ordered = Array.from(leaderboard.values()).sort((a, b) => {
+        if(b.wins !== a.wins) return b.wins - a.wins;
+        if(b.draws !== a.draws) return b.draws - a.draws;
+        return a.losses - b.losses;
+    });
+    res.json({ ok: true, leaderboard: ordered });
+});
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
