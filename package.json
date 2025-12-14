@@ -16,6 +16,7 @@
     "express": "^5.2.1",
     "http": "^0.0.1-security",
     "nodemon": "^3.1.11",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "sql.js": "^1.13.0"
   }
 }

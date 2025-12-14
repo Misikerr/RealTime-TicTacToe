@@ -5,8 +5,15 @@ import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
+import { openPersistentDb } from './db.js';
 
 dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const db = await openPersistentDb({
+    dbFilePath: path.join(__dirname, 'data', 'tictactoe.sqlite')
+});
 
 const app = express();
 const server = http.createServer(app);
@@ -30,6 +37,11 @@ const pendingInvites = new Map(); // code -> {user}
 const playingArray = [];
 const authTokens = new Map(); // token -> user payload
 const leaderboard = new Map(); // userId -> stats
+
+// Hydrate leaderboard from persistent storage
+db.loadLeaderboard().forEach((entry) => {
+    leaderboard.set(String(entry.id), entry);
+});
 
 const hashSecret = TELEGRAM_BOT_TOKEN
   ? crypto.createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest()
@@ -92,6 +104,9 @@ const updateLeaderboard = (match, result, winnerMark) => {
         }
         existing.name = player.name;
         leaderboard.set(key, existing);
+
+        // Persist immediately (debounced flush in db layer)
+        db.upsertLeaderboardEntry(existing);
     };
 
     if(result === 'draw'){
@@ -298,14 +313,14 @@ setInterval(() => {
     }
 }, 1500);
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 // Serve the built frontend (or static assets) from the project root
 app.use(express.static(__dirname));
 
 app.get('/api/config', (_req, res) => {
-    res.json({ telegramBotUsername: TELEGRAM_BOT_USERNAME || null });
+    res.json({
+        telegramBotUsername: TELEGRAM_BOT_USERNAME || null,
+        appHost: process.env.APP_HOST || null
+    });
 });
 
 app.post('/api/auth/telegram', (req, res) => {
@@ -313,6 +328,13 @@ app.post('/api/auth/telegram', (req, res) => {
     const validation = hashSecret ? verifyTelegramAuth(payload) : { valid: false, reason: 'missingSecret' };
 
     if(!validation.valid){
+        if(!ALLOW_GUESTS){
+            return res.status(401).json({
+                ok: false,
+                error: 'Telegram auth verification failed. Check TELEGRAM_BOT_TOKEN/TELEGRAM_BOT_USERNAME and ensure you are running the Express server (node index.js), not only Vite.',
+                reason: validation.reason
+            });
+        }
         const guestId = `guest-${crypto.randomBytes(8).toString('hex')}`;
         const guestName = payload.username || payload.first_name || `guest-${guestId.slice(6, 12)}`;
         const guestUser = {
@@ -324,6 +346,7 @@ app.post('/api/auth/telegram', (req, res) => {
             auth_date: Date.now()
         };
         const token = mintAuthToken(guestUser);
+        db.upsertPlayer({ id: guestUser.id, name: safeDisplayName(guestUser) });
         console.warn('Telegram auth invalid; issuing guest session', { validation, payloadPreview: { id: payload.id, username: payload.username, first_name: payload.first_name, last_name: payload.last_name } });
         return res.json({ ok: true, guest: true, token, user: { id: guestUser.id, username: guestUser.username, first_name: guestUser.first_name, photo_url: guestUser.photo_url } });
     }
@@ -338,7 +361,13 @@ app.post('/api/auth/telegram', (req, res) => {
     };
 
     const token = mintAuthToken(user);
+    db.upsertPlayer({ id: user.id, name: safeDisplayName(user) });
     res.json({ ok: true, token, user: { id: user.id, username: user.username, first_name: user.first_name, photo_url: user.photo_url } });
+});
+
+// Public stats for "how many players have joined"
+app.get('/api/stats', (_req, res) => {
+    res.json({ ok: true, totalPlayers: db.getTotalPlayers() });
 });
 
 app.get('/api/leaderboard', (_req, res) => {

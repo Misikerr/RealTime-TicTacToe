@@ -39,7 +39,7 @@
           <article class="info-card name-card">
             <h2>Login &amp; Match</h2>
             <p id="authStatus">Login with Telegram to start playing.</p>
-            <div id="telegramLogin" data-inline-widget="true"></div>
+            <div id="telegramLogin"></div>
             <script>
               // Capture Telegram auth early; queue until main script attaches handler
               window.__pendingTelegramAuth = window.__pendingTelegramAuth || [];
@@ -55,14 +55,7 @@
                 }
               };
             </script>
-            <script
-              async
-              src="https://telegram.org/js/telegram-widget.js?22"
-              data-telegram-login="tictactoe_auth_bot"
-              data-size="large"
-              data-onauth="__receiveTelegramAuth"
-              data-request-access="write">
-            </script>
+
 
             <div class="name-actions">
               <button id="quickPlay">Quick Play</button>
@@ -77,13 +70,14 @@
             </div>
 
             <div class="name-actions">
-              <input type="text" id="joinCode" placeholder="Paste invite code" />
+              <input type="text" id="joinCode" placeholder="Paste invite code or link" />
               <button id="joinInvite">Join via invite</button>
             </div>
           </article>
 
           <article class="info-card leaderboard-card">
             <h2>Leaderboard</h2>
+            <p id="playerCount"></p>
             <ul id="leaderboardList"></ul>
             <button id="refreshLeaderboard">Refresh leaderboard</button>
           </article>

@@ -31,6 +31,7 @@ const modalMessage = document.getElementById("modalMessage");
 const modalAction = document.getElementById("modalAction");
 const authStatus = document.getElementById("authStatus");
 const leaderboardList = document.getElementById("leaderboardList");
+const playerCountEl = document.getElementById('playerCount');
 const refreshLeaderboardBtn = document.getElementById("refreshLeaderboard");
 const quickPlayBtn = document.getElementById("quickPlay");
 const createInviteBtn = document.getElementById("createInvite");
@@ -55,6 +56,14 @@ let currentUser = null;
 
 if(quickPlayBtn){
     quickPlayBtn.disabled = true;
+}
+
+if(createInviteBtn){
+    createInviteBtn.disabled = true;
+}
+
+if(joinInviteBtn){
+    joinInviteBtn.disabled = true;
 }
 
 if(modalAction){
@@ -115,6 +124,39 @@ const safeDisplayName = (user) => {
     return user.username || user.first_name || `tg-${user.id || 'user'}`;
 };
 
+const extractInviteCode = (rawInput) => {
+    const raw = String(rawInput || '').trim();
+    if(!raw){
+        return '';
+    }
+
+    // Full link pasted
+    try {
+        if(raw.includes('://')){
+            const u = new URL(raw);
+            return String(u.searchParams.get('invite') || '').trim().toLowerCase();
+        }
+    } catch {
+        // ignore
+    }
+
+    // Querystring pasted
+    if(raw.startsWith('?') || raw.includes('invite=')){
+        try {
+            const qs = raw.startsWith('?') ? raw : raw.slice(raw.indexOf('?'));
+            const params = new URLSearchParams(qs);
+            const code = params.get('invite');
+            if(code){
+                return String(code).trim().toLowerCase();
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    return raw.toLowerCase();
+};
+
 const renderLeaderboard = (items = []) => {
     if(!leaderboardList){
         return;
@@ -145,6 +187,22 @@ async function fetchLeaderboard(){
     }
 }
 
+async function fetchStats(){
+    if(!playerCountEl){
+        return;
+    }
+    try {
+        const res = await fetch('/api/stats');
+        const data = await res.json();
+        if(res.ok && data?.ok){
+            const total = Number(data.totalPlayers) || 0;
+            playerCountEl.textContent = `Total players: ${total}`;
+        }
+    } catch (err){
+        console.error('Failed to fetch stats', err);
+    }
+}
+
 async function authenticateWithServer(user){
     console.info('[auth] received payload from widget', user);
     try {
@@ -170,11 +228,18 @@ async function authenticateWithServer(user){
         if(quickPlayBtn){
             quickPlayBtn.disabled = false;
         }
+        if(createInviteBtn){
+            createInviteBtn.disabled = false;
+        }
+        if(joinInviteBtn){
+            joinInviteBtn.disabled = false;
+        }
         statusCards.forEach(card => card.style.display = "block");
         if(nameCard){
             nameCard.style.display = "block";
         }
         await fetchLeaderboard();
+        await fetchStats();
     } catch (err){
         console.error('Auth error', err);
         showModal('Could not complete Telegram login.');
@@ -183,6 +248,25 @@ async function authenticateWithServer(user){
 
 async function loadTelegramWidget(){
     try {
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        const botUser = data?.telegramBotUsername;
+        const appHost = data?.appHost;
+
+        // Normalize appHost to a bare hostname for comparison
+        const normalizedAppHost = appHost
+            ? String(appHost).replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+            : null;
+
+        if(normalizedAppHost && window.location.host !== normalizedAppHost){
+            const base = appHost && /^https?:\/\//i.test(appHost)
+                ? appHost.replace(/\/+$/, '')
+                : `${window.location.protocol}//${normalizedAppHost}`;
+            const target = `${base}${window.location.pathname}${window.location.search}${window.location.hash}`;
+            window.location.href = target;
+            return;
+        }
+
         const container = document.getElementById('telegramLogin');
         const inlinePresent = container && (container.dataset.inlineWidget === 'true');
         const scriptAlreadyOnPage = document.querySelector('script[data-telegram-login]');
@@ -191,9 +275,6 @@ async function loadTelegramWidget(){
             return;
         }
 
-        const res = await fetch('/api/config');
-        const data = await res.json();
-        const botUser = data?.telegramBotUsername;
         if(!botUser){
             if(authStatus){
                 authStatus.textContent = 'Set TELEGRAM_BOT_USERNAME on the server to enable login.';
@@ -209,7 +290,7 @@ async function loadTelegramWidget(){
         script.async = true;
         script.setAttribute('data-telegram-login', botUser);
         script.setAttribute('data-size', 'large');
-        script.setAttribute('data-onauth', 'onTelegramAuth');
+        script.setAttribute('data-onauth', 'onTelegramAuth(user)');
         script.setAttribute('data-request-access', 'write');
         container.appendChild(script);
     } catch (err){
@@ -269,9 +350,9 @@ if(joinInviteBtn){
             showModal("Login with Telegram first.");
             return;
         }
-        const code = joinCodeInput?.value.trim();
+        const code = extractInviteCode(joinCodeInput?.value);
         if(!code){
-            showModal("Enter an invite code.");
+            showModal("Paste an invite code or link.");
             return;
         }
         socket.emit('joinInvite', { token: authToken, code });
@@ -511,6 +592,7 @@ if(refreshLeaderboardBtn){
 // Kick off auth widget and initial leaderboard
 loadTelegramWidget();
 fetchLeaderboard();
+fetchStats();
 
 // Auto-join invite if present in URL
 const urlParams = new URLSearchParams(window.location.search);

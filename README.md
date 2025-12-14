@@ -63,6 +63,15 @@ A real-time multiplayer Tic-Tac-Toe experience built with Node.js, Express, and 
 | `PORT`                | Port used by Express server                   | `3000`  |
 | `TELEGRAM_BOT_TOKEN`  | Bot token used to verify Telegram login hash  | _none_  |
 | `TELEGRAM_BOT_USERNAME` | Bot username used by the Telegram widget    | _none_  |
+| `ALLOW_GUESTS`        | Allow guest sessions if Telegram auth fails   | `false` |
+| `APP_HOST`            | Canonical host (used to redirect if mismatched) | _none_ |
+
+## Telegram Login Widget: “Bot domain invalid”
+If the widget shows a **bot domain** error, Telegram is blocking login because the bot isn’t allowed to authenticate on the domain you’re visiting.
+
+- In Telegram, open `@BotFather` → `/setdomain` → select your bot → set the domain to your site host (no protocol), e.g. `realtime-tictactoe-0f8i.onrender.com`.
+- The page must be served from that exact host (typically HTTPS). `file:///...` won’t work.
+- For local development, Telegram login often won’t work on `localhost`. Use a public HTTPS URL (Render) or a tunnel, or set `ALLOW_GUESTS=true` to test gameplay without Telegram.
 
 ## Deployment Notes
 - Push the repository to GitHub so Render (or similar) can pull from `main`.
