@@ -10,21 +10,6 @@ A real‑time multiplayer Tic‑Tac‑Toe web app built for classrooms and frien
 
 This project is designed so **30+ students** can join, play, and see a shared leaderboard.
 
-## Screenshots
-
-Add the screenshots you shared into `docs/screenshots/` using these filenames (so the README renders correctly):
-
-- `docs/screenshots/mobile-login-and-match.jpg`
-- `docs/screenshots/mobile-invite-and-leaderboard.jpg`
-- `docs/screenshots/mobile-leaderboard-and-board.jpg`
-- `docs/screenshots/mobile-match-in-progress.jpg`
-
-Once those files exist, these images will show up here:
-
-![Login & Match](docs/screenshots/mobile-login-and-match.jpg)
-![Invite & Leaderboard](docs/screenshots/mobile-invite-and-leaderboard.jpg)
-![Leaderboard & Board](docs/screenshots/mobile-leaderboard-and-board.jpg)
-![Match In Progress](docs/screenshots/mobile-match-in-progress.jpg)
 
 ## How To Play
 
