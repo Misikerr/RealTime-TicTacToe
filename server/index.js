@@ -45,9 +45,80 @@ const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
 const ALLOW_GUESTS = String(process.env.ALLOW_GUESTS || '').toLowerCase() === 'true';
 
 const waitingQueue = [];
-const pendingInvites = new Map(); // code -> {user}
+const pendingInvites = new Map(); // code -> {user, socketId}
 const playingArray = [];
 const leaderboard = new Map(); // userId -> stats
+
+// Presence + matchmaking state
+const userSockets = new Map(); // userId -> Set(socketId)
+const activeMatchByUser = new Map(); // userId -> matchId
+
+const roomForMatch = (matchId) => `match:${matchId}`;
+
+const registerSocketUser = (socket, user) => {
+    if(!socket || !user?.id){
+        return;
+    }
+    socket.data.userId = String(user.id);
+    socket.data.userName = safeDisplayName(user);
+    const key = String(user.id);
+    const set = userSockets.get(key) || new Set();
+    set.add(socket.id);
+    userSockets.set(key, set);
+};
+
+const unregisterSocket = (socket) => {
+    const userId = socket?.data?.userId;
+    if(!userId){
+        return;
+    }
+    const set = userSockets.get(userId);
+    if(set){
+        set.delete(socket.id);
+        if(set.size === 0){
+            userSockets.delete(userId);
+        } else {
+            userSockets.set(userId, set);
+        }
+    }
+};
+
+const findActiveMatchByUserId = (userId) => {
+    if(!userId){
+        return { match: null, index: -1 };
+    }
+    const idx = playingArray.findIndex((m) => m?.p1?.id === userId || m?.p2?.id === userId);
+    return { match: idx >= 0 ? playingArray[idx] : null, index: idx };
+};
+
+const endMatch = ({ matchId, reason, disconnectedUserId } = {}) => {
+    if(!matchId){
+        return;
+    }
+    const idx = playingArray.findIndex((m) => m?.matchId === matchId);
+    if(idx === -1){
+        return;
+    }
+    const match = playingArray[idx];
+    const room = match?.room;
+
+    playingArray.splice(idx, 1);
+    if(match?.p1?.id){
+        activeMatchByUser.delete(match.p1.id);
+    }
+    if(match?.p2?.id){
+        activeMatchByUser.delete(match.p2.id);
+    }
+
+    if(room){
+        io.to(room).emit('matchAborted', {
+            reason: reason || 'aborted',
+            disconnectedUserId: disconnectedUserId || null,
+            playerIds: [match?.p1?.id, match?.p2?.id].filter(Boolean),
+            players: [match?.p1?.name, match?.p2?.name].filter(Boolean)
+        });
+    }
+};
 
 // Hydrate leaderboard from persistent storage
 (await db.loadLeaderboard()).forEach((entry) => {
@@ -193,17 +264,52 @@ io.on('connection', (socket) => {
             return;
         }
 
+        registerSocketUser(socket, user);
+
+        // Do not allow a user to join multiple simultaneous matches.
+        const existingMatchId = activeMatchByUser.get(String(user.id));
+        if(existingMatchId){
+            socket.emit('matchError', { message: 'You are already in a match. Finish it before starting a new one.' });
+            return;
+        }
+
         // Prevent duplicate queue entries for the same user
         const alreadyQueued = waitingQueue.some(p => p.id === user.id);
         if(!alreadyQueued){
-            waitingQueue.push({ id: user.id, name: safeDisplayName(user), token });
+            waitingQueue.push({ id: user.id, name: safeDisplayName(user), token, socketId: socket.id });
         }
 
         if(waitingQueue.length >= 2){
             const p1 = waitingQueue.shift();
             const p2 = waitingQueue.shift();
 
+            // If either player is no longer connected, drop and wait for another.
+            const p1Socket = p1?.socketId ? io.sockets.sockets.get(p1.socketId) : null;
+            const p2Socket = p2?.socketId ? io.sockets.sockets.get(p2.socketId) : null;
+            if(!p1Socket || !p2Socket){
+                if(p1Socket){
+                    waitingQueue.unshift(p1);
+                }
+                if(p2Socket){
+                    waitingQueue.unshift(p2);
+                }
+                return;
+            }
+
+            // Re-check active match guard (race safety)
+            if(activeMatchByUser.get(String(p1.id)) || activeMatchByUser.get(String(p2.id))){
+                return;
+            }
+
+            const matchId = crypto.randomBytes(12).toString('hex');
+            const room = roomForMatch(matchId);
+
+            p1Socket.join(room);
+            p2Socket.join(room);
+
             const match = {
+                matchId,
+                room,
                 p1: { id: p1.id, name: p1.name, value: 'X', move: '' },
                 p2: { id: p2.id, name: p2.name, value: 'O', move: '' },
                 sum: 1,
@@ -215,8 +321,11 @@ io.on('connection', (socket) => {
                 currentTurn: 'X'
             };
 
+            activeMatchByUser.set(String(p1.id), matchId);
+            activeMatchByUser.set(String(p2.id), matchId);
+
             playingArray.push(match);
-            io.emit('find', { allPlayers: playingArray });
+            io.to(room).emit('find', { allPlayers: [match] });
         }
     });
 
@@ -226,6 +335,15 @@ io.on('connection', (socket) => {
             socket.emit('authError', { message: 'Unauthorized' });
             return;
         }
+
+        registerSocketUser(socket, user);
+
+        const existingMatchId = activeMatchByUser.get(String(user.id));
+        if(existingMatchId){
+            socket.emit('matchError', { message: 'You are already in a match. Finish it before creating an invite.' });
+            return;
+        }
+
         // One invite per user; replace existing
         for (const [code, entry] of pendingInvites.entries()){
             if(entry.user.id === user.id){
@@ -234,7 +352,7 @@ io.on('connection', (socket) => {
             }
         }
         const code = crypto.randomBytes(6).toString('hex');
-        pendingInvites.set(code, { user });
+        pendingInvites.set(code, { user, socketId: socket.id });
         socket.emit('inviteCreated', { code });
     });
 
@@ -244,6 +362,15 @@ io.on('connection', (socket) => {
             socket.emit('authError', { message: 'Unauthorized' });
             return;
         }
+
+        registerSocketUser(socket, user);
+
+        const existingMatchId = activeMatchByUser.get(String(user.id));
+        if(existingMatchId){
+            socket.emit('matchError', { message: 'You are already in a match. Finish it before joining an invite.' });
+            return;
+        }
+
         const host = pendingInvites.get(code);
         if(!host){
             socket.emit('inviteError', { message: 'Invite not found or already used.' });
@@ -254,9 +381,31 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // Host must still be connected.
+        const hostSocket = host?.socketId ? io.sockets.sockets.get(host.socketId) : null;
+        if(!hostSocket){
+            pendingInvites.delete(code);
+            socket.emit('inviteError', { message: 'Invite host is offline.' });
+            return;
+        }
+
+        const hostExistingMatchId = activeMatchByUser.get(String(host.user.id));
+        if(hostExistingMatchId){
+            socket.emit('inviteError', { message: 'Invite host is already in a match.' });
+            return;
+        }
+
         pendingInvites.delete(code);
 
+        const matchId = crypto.randomBytes(12).toString('hex');
+        const room = roomForMatch(matchId);
+
+        hostSocket.join(room);
+        socket.join(room);
+
         const match = {
+            matchId,
+            room,
             p1: { id: host.user.id, name: safeDisplayName(host.user), value: 'X', move: '' },
             p2: { id: user.id, name: safeDisplayName(user), value: 'O', move: '' },
             sum: 1,
@@ -268,8 +417,11 @@ io.on('connection', (socket) => {
             currentTurn: 'X'
         };
 
+        activeMatchByUser.set(String(host.user.id), matchId);
+        activeMatchByUser.set(String(user.id), matchId);
+
         playingArray.push(match);
-        io.emit('find', { allPlayers: playingArray });
+        io.to(room).emit('find', { allPlayers: [match] });
     });
 
     socket.on('playing', ({ id, token }) => {
@@ -282,6 +434,8 @@ io.on('connection', (socket) => {
             socket.emit('authError', { message: 'Unauthorized' });
             return;
         }
+
+        registerSocketUser(socket, user);
 
         const match = playingArray.find(obj => obj.p1?.id === user.id || obj.p2?.id === user.id);
         if(!match || match.matchFinished){
@@ -315,7 +469,9 @@ io.on('connection', (socket) => {
         match.timedOutMark = null;
         match.currentTurn = playerMark === 'X' ? 'O' : 'X';
 
-        io.emit('playing', { allPlayers: playingArray });
+        if(match.room){
+            io.to(match.room).emit('playing', { allPlayers: [match] });
+        }
     });
 
     socket.on('gameOver', ({ token, result, winnerMark }) => {
@@ -324,6 +480,8 @@ io.on('connection', (socket) => {
             socket.emit('authError', { message: 'Unauthorized' });
             return;
         }
+
+        registerSocketUser(socket, user);
 
         const matchIndex = playingArray.findIndex(obj => obj.p1?.id === user.id || obj.p2?.id === user.id);
         if(matchIndex === -1){
@@ -339,22 +497,65 @@ io.on('connection', (socket) => {
 
         const [finishedMatch] = playingArray.splice(matchIndex, 1);
         const players = [finishedMatch?.p1?.name, finishedMatch?.p2?.name].filter(Boolean);
+        const playerIds = [finishedMatch?.p1?.id, finishedMatch?.p2?.id].filter(Boolean);
+
+        if(finishedMatch?.p1?.id){
+            activeMatchByUser.delete(finishedMatch.p1.id);
+        }
+        if(finishedMatch?.p2?.id){
+            activeMatchByUser.delete(finishedMatch.p2.id);
+        }
 
         updateLeaderboard(finishedMatch, result || 'win', winnerMark);
         io.emit('leaderboardUpdated', { leaderboard: getOrderedLeaderboard() });
 
         const winnerName = winnerMark === 'X' ? finishedMatch?.p1?.name : finishedMatch?.p2?.name;
-        io.emit('matchEnded', {
-            players,
-            result: result || 'win',
-            winner: winnerName || winnerMark || null
-        });
+        const room = finishedMatch?.room;
+        if(room){
+            io.to(room).emit('matchEnded', {
+                players,
+                playerIds,
+                result: result || 'win',
+                winner: winnerName || winnerMark || null
+            });
+        }
+    });
+
+    socket.on('disconnect', () => {
+        // Remove from queue entries (by socket id)
+        for(let i = waitingQueue.length - 1; i >= 0; i--){
+            if(waitingQueue[i]?.socketId === socket.id){
+                waitingQueue.splice(i, 1);
+            }
+        }
+
+        // Remove any invites created by this socket
+        for (const [code, entry] of pendingInvites.entries()){
+            if(entry?.socketId === socket.id){
+                pendingInvites.delete(code);
+            }
+        }
+
+        const userId = socket?.data?.userId;
+        unregisterSocket(socket);
+        if(!userId){
+            return;
+        }
+
+        // If this user was in an active match and they have no other sockets connected, end it.
+        if(userSockets.has(userId)){
+            return;
+        }
+
+        const matchId = activeMatchByUser.get(userId);
+        if(matchId){
+            endMatch({ matchId, reason: 'disconnect', disconnectedUserId: userId });
+        }
     });
 });
 
 setInterval(() => {
     const now = Date.now();
-    let updated = false;
 
     playingArray.forEach(match => {
         if(match.matchFinished){
@@ -369,13 +570,12 @@ setInterval(() => {
             match.timedOutPlayer = timedOutPlayer;
             match.timedOutMark = timedOutMark;
             match.currentTurn = timedOutMark === 'X' ? 'O' : 'X';
-            updated = true;
+
+            if(match.room){
+                io.to(match.room).emit('playing', { allPlayers: [match], timeout: true });
+            }
         }
     });
-
-    if(updated){
-        io.emit('playing', { allPlayers: playingArray, timeout: true });
-    }
 }, 1500);
 
 // Serve the frontend/static assets from the project root

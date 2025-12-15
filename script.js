@@ -434,6 +434,8 @@ if(joinInviteBtn){
 socket.on("find", (e)=>{
     const allPlayers = e.allPlayers || []; 
 
+    const myUserId = currentUser?.id ? String(currentUser.id) : null;
+
     document.getElementById("userCont").style.display = "block";
     document.getElementById("oppNameCont").style.display = "block";
     document.getElementById("valueCont").style.display = "block";
@@ -454,14 +456,21 @@ socket.on("find", (e)=>{
     let oppName = "";
     let value = "";
 
-    const foundObj = allPlayers.find(obj => obj.p1?.name === name || obj.p2?.name === name);
+    const foundObj = allPlayers.find(obj => {
+        if(myUserId){
+            return String(obj.p1?.id || '') === myUserId || String(obj.p2?.id || '') === myUserId;
+        }
+        return obj.p1?.name === name || obj.p2?.name === name;
+    });
 
     if(!foundObj){
         console.warn("Player not found in match list yet", { name, allPlayers });
         return;
     }
 
-    const isPlayerOne = foundObj.p1?.name === name;
+    const isPlayerOne = myUserId
+        ? String(foundObj.p1?.id || '') === myUserId
+        : foundObj.p1?.name === name;
     oppName = isPlayerOne ? foundObj.p2?.name : foundObj.p1?.name;
     value = isPlayerOne ? 'X' : 'O';
 
@@ -496,7 +505,14 @@ socket.on("playing", (payload)=>{
         return;
     }
 
-    const foundObj = allPlayers.find(obj => obj.p1?.name === name || obj.p2?.name === name);
+    const myUserId = currentUser?.id ? String(currentUser.id) : null;
+
+    const foundObj = allPlayers.find(obj => {
+        if(myUserId){
+            return String(obj.p1?.id || '') === myUserId || String(obj.p2?.id || '') === myUserId;
+        }
+        return obj.p1?.name === name || obj.p2?.name === name;
+    });
     if(!foundObj){
         console.warn("Match not found in update", { name, allPlayers });
         return;
@@ -568,9 +584,16 @@ function check(name){
     }
 }
 
-socket.on("matchEnded", ({ players, result, winner }) => {
-    if(!Array.isArray(players) || !players.includes(name)){
-        return;
+socket.on("matchEnded", ({ players, playerIds, result, winner }) => {
+    const myUserId = currentUser?.id ? String(currentUser.id) : null;
+    if(Array.isArray(playerIds) && myUserId){
+        if(!playerIds.map(String).includes(myUserId)){
+            return;
+        }
+    } else {
+        if(!Array.isArray(players) || !players.includes(name)){
+            return;
+        }
     }
 
     matchFinished = true;
@@ -586,6 +609,30 @@ socket.on("matchEnded", ({ players, result, winner }) => {
     }
 
     showModal(message, "Play again", () => window.location.reload());
+});
+
+socket.on('matchAborted', ({ reason, disconnectedUserId, playerIds }) => {
+    const myUserId = currentUser?.id ? String(currentUser.id) : null;
+    if(!myUserId){
+        return;
+    }
+    if(Array.isArray(playerIds) && !playerIds.map(String).includes(myUserId)){
+        return;
+    }
+
+    matchFinished = true;
+    disableBoard();
+    currentTurn = null;
+    stopTurnTimer();
+
+    const message = reason === 'disconnect'
+        ? 'Opponent disconnected. Match ended.'
+        : 'Match ended.';
+    showModal(message, 'Okay', () => window.location.reload());
+});
+
+socket.on('matchError', ({ message }) => {
+    showModal(message || 'Cannot start a new match right now.');
 });
 
 socket.on("invalidMove", ({ reason }) => {
