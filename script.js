@@ -30,6 +30,7 @@ const modal = document.getElementById("gameModal");
 const modalMessage = document.getElementById("modalMessage");
 const modalAction = document.getElementById("modalAction");
 const authStatus = document.getElementById("authStatus");
+const telegramLoginContainer = document.getElementById('telegramLogin');
 const leaderboardList = document.getElementById("leaderboardList");
 const playerCountEl = document.getElementById('playerCount');
 const refreshLeaderboardBtn = document.getElementById("refreshLeaderboard");
@@ -45,6 +46,91 @@ statusCards.forEach(card => {
 });
 
 const socket = io();
+
+const STORAGE_TOKEN_KEY = 'ttt_auth_token';
+const STORAGE_USER_KEY = 'ttt_auth_user';
+
+const clearStoredSession = () => {
+    try {
+        localStorage.removeItem(STORAGE_TOKEN_KEY);
+        localStorage.removeItem(STORAGE_USER_KEY);
+    } catch {
+        // ignore
+    }
+};
+
+const persistSession = ({ token, user }) => {
+    try {
+        if(token){
+            localStorage.setItem(STORAGE_TOKEN_KEY, String(token));
+        }
+        if(user){
+            localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(user));
+        }
+    } catch {
+        // ignore
+    }
+};
+
+const applyLoggedInState = async () => {
+    name = safeDisplayName(currentUser);
+    const userEl = document.getElementById("user");
+    if(userEl){
+        userEl.innerText = name;
+    }
+    if(authStatus){
+        authStatus.textContent = `Logged in as ${currentUser?.username ? '@' + currentUser.username : name}`;
+    }
+
+    if(nameCard){
+        nameCard.classList.add('is-authenticated');
+    }
+
+    // Hide/remove the Telegram login button once authenticated
+    if(telegramLoginContainer){
+        telegramLoginContainer.innerHTML = '';
+        telegramLoginContainer.style.display = 'none';
+    }
+
+    if(quickPlayBtn){
+        quickPlayBtn.disabled = false;
+    }
+    if(createInviteBtn){
+        createInviteBtn.disabled = false;
+    }
+    if(joinInviteBtn){
+        joinInviteBtn.disabled = false;
+    }
+
+    statusCards.forEach(card => card.style.display = "block");
+    if(nameCard){
+        nameCard.style.display = "block";
+    }
+
+    await fetchLeaderboard();
+    await fetchStats();
+};
+
+const restoreSessionFromStorage = async () => {
+    try {
+        const token = localStorage.getItem(STORAGE_TOKEN_KEY);
+        const userRaw = localStorage.getItem(STORAGE_USER_KEY);
+        if(!token || !userRaw){
+            return;
+        }
+        const user = JSON.parse(userRaw);
+        if(!user?.id){
+            return;
+        }
+
+        authToken = token;
+        currentUser = user;
+        await applyLoggedInState();
+    } catch (err){
+        console.warn('Failed to restore session', err);
+        clearStoredSession();
+    }
+};
 
 let name;
 let myMark = '';
@@ -168,7 +254,7 @@ const renderLeaderboard = (items = []) => {
         leaderboardList.appendChild(li);
         return;
     }
-    items.slice(0, 10).forEach((entry, idx) => {
+    items.forEach((entry, idx) => {
         const li = document.createElement('li');
         li.textContent = `${idx + 1}. ${entry.name} — W:${entry.wins} D:${entry.draws} L:${entry.losses}`;
         leaderboardList.appendChild(li);
@@ -220,26 +306,8 @@ async function authenticateWithServer(user){
         }
         authToken = data.token;
         currentUser = data.user;
-        name = safeDisplayName(currentUser);
-        document.getElementById("user").innerText = name;
-        if(authStatus){
-            authStatus.textContent = `Logged in as ${currentUser.username ? '@' + currentUser.username : name}`;
-        }
-        if(quickPlayBtn){
-            quickPlayBtn.disabled = false;
-        }
-        if(createInviteBtn){
-            createInviteBtn.disabled = false;
-        }
-        if(joinInviteBtn){
-            joinInviteBtn.disabled = false;
-        }
-        statusCards.forEach(card => card.style.display = "block");
-        if(nameCard){
-            nameCard.style.display = "block";
-        }
-        await fetchLeaderboard();
-        await fetchStats();
+        persistSession({ token: authToken, user: currentUser });
+        await applyLoggedInState();
     } catch (err){
         console.error('Auth error', err);
         showModal('Could not complete Telegram login.');
@@ -247,6 +315,10 @@ async function authenticateWithServer(user){
 }
 
 async function loadTelegramWidget(){
+    // If already logged in (including restored session), do not render the login widget.
+    if(authToken && currentUser){
+        return;
+    }
     try {
         const res = await fetch('/api/config');
         const data = await res.json();
@@ -524,7 +596,42 @@ socket.on("leaderboardUpdated", ({ leaderboard }) => {
     renderLeaderboard(leaderboard || []);
 });
 
+socket.on('statsUpdated', ({ totalPlayers }) => {
+    if(!playerCountEl){
+        return;
+    }
+    const total = Number(totalPlayers) || 0;
+    playerCountEl.textContent = `Total players: ${total}`;
+});
+
 socket.on("authError", ({ message }) => {
+    clearStoredSession();
+    authToken = null;
+    currentUser = null;
+
+    if(nameCard){
+        nameCard.classList.remove('is-authenticated');
+    }
+
+    // Show Telegram login again
+    if(authStatus){
+        authStatus.textContent = 'Login with Telegram to start playing.';
+    }
+    if(telegramLoginContainer){
+        telegramLoginContainer.style.display = '';
+        telegramLoginContainer.innerHTML = '';
+    }
+    loadTelegramWidget();
+
+    if(quickPlayBtn){
+        quickPlayBtn.disabled = true;
+    }
+    if(createInviteBtn){
+        createInviteBtn.disabled = true;
+    }
+    if(joinInviteBtn){
+        joinInviteBtn.disabled = true;
+    }
     showModal(message || 'Authentication required.');
 });
 
@@ -590,7 +697,10 @@ if(refreshLeaderboardBtn){
 }
 
 // Kick off auth widget and initial leaderboard
-loadTelegramWidget();
+(async () => {
+    await restoreSessionFromStorage();
+    await loadTelegramWidget();
+})();
 fetchLeaderboard();
 fetchStats();
 

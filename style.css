@@ -181,6 +181,16 @@ p {
   flex-wrap: wrap;
 }
 
+/* Login & Match: better spacing once authenticated (Telegram button hidden) */
+.name-card.is-authenticated {
+  gap: 0.85rem;
+}
+
+.name-card.is-authenticated #authStatus {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
 #inviteLink,
 #joinCode {
   flex: 1;

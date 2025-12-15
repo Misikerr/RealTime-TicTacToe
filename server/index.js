@@ -5,15 +5,27 @@ import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
+import jwt from 'jsonwebtoken';
 import { openPersistentDb } from './db.js';
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 
-const db = await openPersistentDb({
-    dbFilePath: path.join(__dirname, 'data', 'tictactoe.sqlite')
-});
+let db;
+try {
+    db = await openPersistentDb({
+        mongoUri: process.env.MONGODB_URI,
+        dbName: process.env.MONGODB_DB_NAME
+    });
+    console.log('[startup] MongoDB connected', {
+        dbName: process.env.MONGODB_DB_NAME || 'tictactoe'
+    });
+} catch (err){
+    console.error('[startup] Failed to connect to MongoDB. Set MONGODB_URI/MONGODB_DB_NAME and ensure MongoDB is running.', err);
+    process.exit(1);
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -35,13 +47,29 @@ const ALLOW_GUESTS = String(process.env.ALLOW_GUESTS || '').toLowerCase() === 't
 const waitingQueue = [];
 const pendingInvites = new Map(); // code -> {user}
 const playingArray = [];
-const authTokens = new Map(); // token -> user payload
 const leaderboard = new Map(); // userId -> stats
 
 // Hydrate leaderboard from persistent storage
-db.loadLeaderboard().forEach((entry) => {
+(await db.loadLeaderboard()).forEach((entry) => {
     leaderboard.set(String(entry.id), entry);
 });
+
+const getOrderedLeaderboard = () => {
+    return Array.from(leaderboard.values()).sort((a, b) => {
+        if(b.wins !== a.wins) return b.wins - a.wins;
+        if(b.draws !== a.draws) return b.draws - a.draws;
+        return a.losses - b.losses;
+    });
+};
+
+const broadcastStats = async () => {
+    try {
+        const totalPlayers = await db.getTotalPlayers();
+        io.emit('statsUpdated', { totalPlayers });
+    } catch (err){
+        console.error('[db] statsUpdated broadcast failed', err);
+    }
+};
 
 const hashSecret = TELEGRAM_BOT_TOKEN
   ? crypto.createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest()
@@ -72,17 +100,41 @@ const verifyTelegramAuth = (payload = {}) => {
     return { valid: hmac === hash, reason: hmac === hash ? null : 'badSignature', computed: hmac, provided: hash };
 };
 
+const SESSION_SECRET = String(process.env.SESSION_SECRET || TELEGRAM_BOT_TOKEN || '').trim();
+if(!SESSION_SECRET){
+    console.warn('[startup] SESSION_SECRET is not set; generating an ephemeral secret (logins will NOT survive server restarts).');
+}
+const effectiveSessionSecret = SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+
 const mintAuthToken = (user) => {
-    const token = crypto.randomBytes(24).toString('hex');
-    authTokens.set(token, user);
-    return token;
+    // Keep payload minimal; Telegram auth has already been validated at issuance.
+    const payload = {
+        id: String(user.id),
+        username: user.username || null,
+        first_name: user.first_name || null,
+        photo_url: user.photo_url || null
+    };
+    return jwt.sign(payload, effectiveSessionSecret, { expiresIn: '30d' });
 };
 
 const requireUserFromToken = (token) => {
     if(!token){
         return null;
     }
-    return authTokens.get(token) || null;
+    try {
+        const decoded = jwt.verify(String(token), effectiveSessionSecret);
+        if(!decoded || !decoded.id){
+            return null;
+        }
+        return {
+            id: String(decoded.id),
+            username: decoded.username || null,
+            first_name: decoded.first_name || null,
+            photo_url: decoded.photo_url || null
+        };
+    } catch {
+        return null;
+    }
 };
 
 const updateLeaderboard = (match, result, winnerMark) => {
@@ -105,8 +157,10 @@ const updateLeaderboard = (match, result, winnerMark) => {
         existing.name = player.name;
         leaderboard.set(key, existing);
 
-        // Persist immediately (debounced flush in db layer)
-        db.upsertLeaderboardEntry(existing);
+        // Persist immediately
+        void db.upsertLeaderboardEntry(existing).catch((err) => {
+            console.error('[db] upsert leaderboard failed', err);
+        });
     };
 
     if(result === 'draw'){
@@ -121,6 +175,17 @@ const updateLeaderboard = (match, result, winnerMark) => {
 };
 
 io.on('connection', (socket) => {
+    // Push current state to newly connected clients
+    socket.emit('leaderboardUpdated', { leaderboard: getOrderedLeaderboard() });
+    void (async () => {
+        try {
+            const totalPlayers = await db.getTotalPlayers();
+            socket.emit('statsUpdated', { totalPlayers });
+        } catch (err){
+            console.error('[db] stats snapshot failed', err);
+        }
+    })();
+
     socket.on('quickFind', ({ token }) => {
         const user = requireUserFromToken(token);
         if(!user){
@@ -276,7 +341,7 @@ io.on('connection', (socket) => {
         const players = [finishedMatch?.p1?.name, finishedMatch?.p2?.name].filter(Boolean);
 
         updateLeaderboard(finishedMatch, result || 'win', winnerMark);
-        io.emit('leaderboardUpdated', { leaderboard: Array.from(leaderboard.values()) });
+        io.emit('leaderboardUpdated', { leaderboard: getOrderedLeaderboard() });
 
         const winnerName = winnerMark === 'X' ? finishedMatch?.p1?.name : finishedMatch?.p2?.name;
         io.emit('matchEnded', {
@@ -313,8 +378,8 @@ setInterval(() => {
     }
 }, 1500);
 
-// Serve the built frontend (or static assets) from the project root
-app.use(express.static(__dirname));
+// Serve the frontend/static assets from the project root
+app.use(express.static(PROJECT_ROOT));
 
 app.get('/api/config', (_req, res) => {
     res.json({
@@ -346,7 +411,21 @@ app.post('/api/auth/telegram', (req, res) => {
             auth_date: Date.now()
         };
         const token = mintAuthToken(guestUser);
-        db.upsertPlayer({ id: guestUser.id, name: safeDisplayName(guestUser) });
+        const guestDisplayName = safeDisplayName(guestUser);
+        (async () => {
+            try {
+                await db.upsertPlayer({ id: guestUser.id, name: guestDisplayName });
+                if(!leaderboard.has(String(guestUser.id))){
+                    const entry = { id: guestUser.id, name: guestDisplayName, wins: 0, losses: 0, draws: 0 };
+                    leaderboard.set(String(guestUser.id), entry);
+                    await db.upsertLeaderboardEntry(entry);
+                    io.emit('leaderboardUpdated', { leaderboard: getOrderedLeaderboard() });
+                }
+                await broadcastStats();
+            } catch (err){
+                console.error('[db] guest upsert/broadcast failed', err);
+            }
+        })();
         console.warn('Telegram auth invalid; issuing guest session', { validation, payloadPreview: { id: payload.id, username: payload.username, first_name: payload.first_name, last_name: payload.last_name } });
         return res.json({ ok: true, guest: true, token, user: { id: guestUser.id, username: guestUser.username, first_name: guestUser.first_name, photo_url: guestUser.photo_url } });
     }
@@ -361,31 +440,55 @@ app.post('/api/auth/telegram', (req, res) => {
     };
 
     const token = mintAuthToken(user);
-    db.upsertPlayer({ id: user.id, name: safeDisplayName(user) });
+    const displayName = safeDisplayName(user);
+    (async () => {
+        try {
+            await db.upsertPlayer({ id: user.id, name: displayName });
+            if(!leaderboard.has(String(user.id))){
+                const entry = { id: user.id, name: displayName, wins: 0, losses: 0, draws: 0 };
+                leaderboard.set(String(user.id), entry);
+                await db.upsertLeaderboardEntry(entry);
+                io.emit('leaderboardUpdated', { leaderboard: getOrderedLeaderboard() });
+            }
+            await broadcastStats();
+        } catch (err){
+            console.error('[db] upsert/broadcast failed', err);
+        }
+    })();
     res.json({ ok: true, token, user: { id: user.id, username: user.username, first_name: user.first_name, photo_url: user.photo_url } });
 });
 
 // Public stats for "how many players have joined"
-app.get('/api/stats', (_req, res) => {
-    res.json({ ok: true, totalPlayers: db.getTotalPlayers() });
+app.get('/api/stats', async (_req, res) => {
+    try {
+        const totalPlayers = await db.getTotalPlayers();
+        res.json({ ok: true, totalPlayers });
+    } catch (err){
+        console.error('[db] stats failed', err);
+        res.status(500).json({ ok: false, error: 'Failed to load stats' });
+    }
 });
 
 app.get('/api/leaderboard', (_req, res) => {
-    const ordered = Array.from(leaderboard.values()).sort((a, b) => {
-        if(b.wins !== a.wins) return b.wins - a.wins;
-        if(b.draws !== a.draws) return b.draws - a.draws;
-        return a.losses - b.losses;
-    });
-    res.json({ ok: true, leaderboard: ordered });
+    res.json({ ok: true, leaderboard: getOrderedLeaderboard() });
 });
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+    res.sendFile(path.join(PROJECT_ROOT, 'index.html'));
 });
 
 const PORT = Number(process.env.PORT) || 3000;
 
+server.on('error', (err) => {
+    if(err && err.code === 'EADDRINUSE'){
+        console.error(`[startup] Port ${PORT} is already in use. Stop the other process or set PORT to a free value in .env.`);
+        process.exit(1);
+    }
+    console.error('[startup] Server error', err);
+    process.exit(1);
+});
+
 server.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(`[startup] Server is running on http://localhost:${PORT}`);
 });
 
